@@ -1,0 +1,10 @@
+{
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["./ui"]
+    }
+  ],
+  "reportMissingImports": false,
+  "reportPrivateImportUsage": false
+}
