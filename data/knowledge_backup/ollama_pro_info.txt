@@ -1,0 +1,3 @@
+﻿Ollama Pro is an advanced AI assistant built with Streamlit and Ollama.
+It supports RAG, short answers, and professional responses.
+Key features: document upload, chat history, multiple models.

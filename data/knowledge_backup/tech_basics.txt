@@ -1,0 +1,2 @@
+﻿Python is a programming language. Django is a web framework. FastAPI is for APIs.
+Machine Learning uses scikit-learn and PyTorch. Data Science uses pandas.

@@ -1,0 +1,18 @@
+# Core
+faiss-cpu>=1.7.4
+numpy>=1.24
+ollama>=0.3.0
+
+# Optional but recommended
+rank-bm25>=0.2.2          # better BM25 (a pure-python fallback ships in retriever.py)
+tiktoken>=0.7.0           # accurate token counts (4-char heuristic fallback ships in chunking.py)
+sentence-transformers>=2.7.0  # local embeddings + cross-encoder reranker
+
+# For agents (Excel cleaner + code agent + demo UI)
+pandas>=2.0
+openpyxl>=3.1
+matplotlib>=3.7
+streamlit>=1.30
+pypdf>=4.0
+requests>=2.31
+beautifulsoup4>=4.12
