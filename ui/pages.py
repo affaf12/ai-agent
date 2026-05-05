@@ -47,9 +47,9 @@ if BASE_DIR not in sys.path:
 
 # Import core types for type hints
 try:
-    from core.ollama_client import OllamaClient
+    from core.ollama_client import OllamaClient as _BaseOllamaClient
 except ImportError:
-    from ollama_client import OllamaClient
+    from ollama_client import OllamaClient as _BaseOllamaClient
 from core.session import SessionManager
 from core.auth import AuthManager, SecurityManager
 from core.analytics import Analytics
@@ -57,7 +57,7 @@ from core.analytics import Analytics
 try:
     from core.rag_system_pro import RAGSystem
     from core.rag_system_pro.agents import (
-        ExcelAgent, CodeAgent, DocWriterAgent, 
+        ExcelAgent, CodeAgent, DocWriterAgent,
         WebResearchAgent, SQLAgent, LLMClient,
         available_agents
     )
@@ -82,6 +82,61 @@ except ImportError:
 from ui.components import UIComponents
 from core.config import CONFIG, get_optimal_model, get_model_info, LLM_MODEL
 
+# --- PATCH: Ollama Cloud Support ---
+try:
+    from ollama import Client as _OllamaOfficial
+    _OFFICIAL_AVAILABLE = True
+except ImportError:
+    _OFFICIAL_AVAILABLE = False
+
+class OllamaClientCloud:
+    """Drop-in replacement that adds Bearer auth for ollama.com"""
+    def __init__(self, host: str):
+        api_key = st.secrets.get("OLLAMA_API_KEY", "") if hasattr(st, 'secrets') else ""
+        headers = {}
+        if api_key and "ollama.com" in host:
+            headers = {"Authorization": f"Bearer {api_key}"}
+
+        if _OFFICIAL_AVAILABLE:
+            self.client = _OllamaOfficial(host=host, headers=headers)
+            self._use_official = True
+        else:
+            self.client = _BaseOllamaClient(host)
+            self._use_official = False
+            if headers and hasattr(self.client, 'session'):
+                self.client.session.headers.update(headers)
+
+    def health(self):
+        try:
+            if self._use_official:
+                models = self.client.list()
+                models_info = models.get('models', []) if isinstance(models, dict) else models
+                return True, None, models_info
+            else:
+                return self.client.health()
+        except Exception as e:
+            return False, str(e), []
+
+    def chat_stream(self, model, messages, options):
+        if self._use_official:
+            stream = self.client.chat(model=model, messages=messages, options=options or {}, stream=True)
+            for chunk in stream:
+                content = chunk.get('message', {}).get('content', '')
+                if content:
+                    yield content
+        else:
+            yield from self.client.chat_stream(model, messages, options)
+
+    def chat_once(self, model, messages, options):
+        if self._use_official:
+            resp = self.client.chat(model=model, messages=messages, options=options or {}, stream=False)
+            return resp['message']['content'], None
+        else:
+            return self.client.chat_once(model, messages, options)
+
+# Override the original client
+OllamaClient = OllamaClientCloud
+
 # --- PATCH: remove timestamp HTML that was showing as raw code ---
 def _clean_render_message(role: str, content: str, timestamp=None, images=None, idx=None, **kwargs):
     """Override UIComponents.render_message to hide the broken timestamp div."""
@@ -105,7 +160,6 @@ def _clean_render_message(role: str, content: str, timestamp=None, images=None, 
 
 # Apply patch
 UIComponents.render_message = staticmethod(_clean_render_message)
-
 
 # Smart model auto-selection enabled
 
@@ -140,13 +194,13 @@ def _init_global_rag():
     global GLOBAL_RAG
     if GLOBAL_RAG is not None:
         return GLOBAL_RAG
-    
+
     from pathlib import Path
-    
+
     # Use new RAG system if available
     if PRO_AGENTS_AVAILABLE:
         rag = RAGSystem(
-            llm_model=get_optimal_model(),  # Auto-selected based on RAM
+            llm_model=get_optimal_model(), # Auto-selected based on RAM
             embed_model="nomic-embed-text",
             index_path="data/faiss.index"
         )
@@ -176,13 +230,12 @@ def _init_global_rag():
                 print(f"[RAG INIT] DONE - {loaded} files")
         except Exception as e:
             print(f"[RAG INIT] ERROR: {e}")
-    
+
     GLOBAL_RAG = rag
     return rag
 
 # Initialize on import
 _init_global_rag()
-
 
 # Multi-task import (optional)
 try:
@@ -202,7 +255,6 @@ if not hasattr(SecurityManager, 'sanitize_input'):
         return text[:10000]
     SecurityManager.sanitize_input = staticmethod(_sanitize_input)
 
-
 # =============================================================================
 # BACKGROUND GENERATION INFRASTRUCTURE
 # =============================================================================
@@ -219,29 +271,23 @@ class GenerationJob:
     started_at: float = field(default_factory=time.time)
     thread: Optional[threading.Thread] = None
 
-
 _GENERATION_REGISTRY: Dict[str, GenerationJob] = {}
 _REGISTRY_LOCK = threading.Lock()
 
-
 def _job_key(user_id: Any, session_id: Any) -> str:
     return f"{user_id}::{session_id or 'unsaved'}"
-
 
 def _get_job(user_id: Any, session_id: Any) -> Optional[GenerationJob]:
     with _REGISTRY_LOCK:
         return _GENERATION_REGISTRY.get(_job_key(user_id, session_id))
 
-
 def _set_job(user_id: Any, session_id: Any, job: GenerationJob) -> None:
     with _REGISTRY_LOCK:
         _GENERATION_REGISTRY[_job_key(user_id, session_id)] = job
 
-
 def _pop_job(user_id: Any, session_id: Any) -> Optional[GenerationJob]:
     with _REGISTRY_LOCK:
         return _GENERATION_REGISTRY.pop(_job_key(user_id, session_id), None)
-
 
 def _start_generation(
     client: "OllamaClient",
@@ -264,7 +310,7 @@ def _start_generation(
                 with job.state_lock:
                     job.full_response += chunk
                 chunk_queue.put(chunk)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e: # noqa: BLE001
             with job.state_lock:
                 job.error = str(e)
         finally:
@@ -277,7 +323,6 @@ def _start_generation(
     _set_job(user_id, session_id, job)
     thread.start()
     return job
-
 
 # =============================================================================
 # ENHANCED FILE MANAGEMENT SYSTEM
@@ -293,11 +338,11 @@ class FileQueueItem:
     bytes_data: bytes
     uploaded_at: datetime
     processed: bool = False
-    
+
     def get_size_mb(self) -> float:
         """Get file size in MB"""
         return self.size / (1024 * 1024)
-    
+
     def get_size_display(self) -> str:
         """Get human-readable file size"""
         mb = self.get_size_mb()
@@ -308,19 +353,17 @@ class FileQueueItem:
             return f"{kb:.2f} KB"
         return f"{self.size} bytes"
 
-
 def _init_file_queue():
     """Initialize file queue in session state"""
     if 'file_queue' not in st.session_state:
-        st.session_state.file_queue = {}  # {file_id: FileQueueItem}
+        st.session_state.file_queue = {} # {file_id: FileQueueItem}
     if 'processed_files' not in st.session_state:
-        st.session_state.processed_files = []  # List of processed file names
-
+        st.session_state.processed_files = [] # List of processed file names
 
 def _add_file_to_queue(file_obj) -> str:
     """Add a file to the processing queue and return file_id"""
     _init_file_queue()
-    
+
     file_id = str(uuid.uuid4())[:8]
     file_item = FileQueueItem(
         file_id=file_id,
@@ -330,27 +373,23 @@ def _add_file_to_queue(file_obj) -> str:
         bytes_data=file_obj.getvalue(),
         uploaded_at=datetime.now()
     )
-    
+
     st.session_state.file_queue[file_id] = file_item
     return file_id
-
 
 def _get_queued_files() -> List[FileQueueItem]:
     """Get all files in queue (processed and unprocessed)"""
     _init_file_queue()
     return list(st.session_state.file_queue.values())
 
-
 def _get_unprocessed_files() -> List[FileQueueItem]:
     """Get only unprocessed files"""
     return [f for f in _get_queued_files() if not f.processed]
-
 
 def _get_file_from_queue(file_id: str) -> Optional[FileQueueItem]:
     """Get a specific file from queue"""
     _init_file_queue()
     return st.session_state.file_queue.get(file_id)
-
 
 def _mark_file_processed(file_id: str) -> None:
     """Mark a file as processed"""
@@ -359,51 +398,48 @@ def _mark_file_processed(file_id: str) -> None:
         st.session_state.file_queue[file_id].processed = True
         st.session_state.processed_files.append(st.session_state.file_queue[file_id].name)
 
-
 def _clear_processed_files() -> None:
     """Clear all processed files from queue"""
     _init_file_queue()
     st.session_state.file_queue = {
-        fid: f for fid, f in st.session_state.file_queue.items() 
+        fid: f for fid, f in st.session_state.file_queue.items()
         if not f.processed
     }
-
 
 def _get_queue_info() -> Dict[str, Any]:
     """Get queue statistics"""
     _init_file_queue()
     all_files = _get_queued_files()
     unprocessed = _get_unprocessed_files()
-    
+
     total_size = sum(f.size for f in all_files)
-    
+
     return {
         'total_files': len(all_files),
         'unprocessed_count': len(unprocessed),
         'total_size': total_size,
         'total_size_display': FileQueueItem(
-            file_id="", name="", size=total_size, file_type="", 
+            file_id="", name="", size=total_size, file_type="",
             bytes_data=b"", uploaded_at=datetime.now()
         ).get_size_display()
     }
 
-
 def login_screen():
     """Render authentication screen"""
     col1, col2, col3 = st.columns([1, 2, 1])
-    
+
     with col2:
         st.markdown('<h1 class="main-header" style="text-align: center;">🦋 Ollama Pro v7.5</h1>', unsafe_allow_html=True)
         st.markdown('<p class="sub-header" style="text-align: center;">Enterprise AI Platform</p>', unsafe_allow_html=True)
-        
+
         tab1, tab2 = st.tabs(["Sign In", "Create Account"])
-        
+
         with tab1:
             with st.form("login_form"):
                 username = st.text_input("Username")
                 password = st.text_input("Password", type="password")
                 submit = st.form_submit_button("Sign In", use_container_width=True, type="primary")
-                
+
                 if submit:
                     user = AuthManager.authenticate(username, password)
                     if user:
@@ -413,16 +449,16 @@ def login_screen():
                         st.rerun()
                     else:
                         st.error("Invalid credentials")
-        
+
         with tab2:
             with st.form("register_form"):
                 new_user = st.text_input("Choose Username")
                 new_pass = st.text_input("Choose Password", type="password")
                 confirm_pass = st.text_input("Confirm Password", type="password")
                 reg_submit = st.form_submit_button("Create Account", use_container_width=True, type="primary")
-                
+
                 if reg_submit:
-                    if new_pass != confirm_pass:
+                    if new_pass!= confirm_pass:
                         st.error("Passwords don't match")
                     elif len((new_user or "").strip()) < 3:
                         st.error("Username must be at least 3 characters")
@@ -433,11 +469,10 @@ def login_screen():
                     else:
                         st.error("Username already exists")
 
-
 def render_sidebar(client: OllamaClient):
     """Render sidebar with all controls"""
     user = st.session_state.user
-    
+
     st.markdown(f"""
     <div class="sidebar-header">
         <h3 style="margin: 0;">🦋 Pro v7.5</h3>
@@ -447,18 +482,18 @@ def render_sidebar(client: OllamaClient):
         <p style="margin: 0; font-size: 0.875rem; color: #999;">@{user['username']}</p>
     </div>
     """, unsafe_allow_html=True)
-    
+
     # User actions
     if st.button("🚪 Sign Out", use_container_width=True, type="secondary"):
         SessionManager.logout()
         st.rerun()
-    
+
     st.divider()
-    
+
     # Model selector with info
     ok, err, models_info = client.health()
     models = [m.name if hasattr(m, "name") else m.get("name") for m in models_info] if models_info else []
-    
+
     if models:
         selected_model = st.selectbox(
             "🤖 Model",
@@ -466,51 +501,51 @@ def render_sidebar(client: OllamaClient):
             index=0 if st.session_state.model not in models else models.index(st.session_state.model)
         )
         st.session_state.model = selected_model
-        
+
         # Show model info
         model_info = next((m for m in models_info if (m.name if hasattr(m, "name") else m.get("name")) == selected_model), None)
         with st.expander("Model Details"):
             if model_info:
                 info_dict = asdict(model_info) if hasattr(model_info, "__dataclass_fields__") else dict(model_info)
-                st.json({k: v for k, v in info_dict.items() if k != "name"})
-    
+                st.json({k: v for k, v in info_dict.items() if k!= "name"})
+
     st.divider()
-    
+
     # Feature toggles
     st.markdown("**⚙️ Features**")
-    
-    st.toggle("🔍 RAG System", key="rag_enabled", 
+
+    st.toggle("🔍 RAG System", key="rag_enabled",
               help="Retrieval-Augmented Generation for knowledge base")
-    
+
     st.toggle("🖼️ Vision", key="vision_enabled",
               help="Multi-modal image understanding")
-    
+
     st.toggle("🔊 Text-to-Speech", key="tts_enabled",
               help="AI-generated voice responses")
-    
+
     st.toggle("📊 Token Counter", key="show_token_count",
               help="Show real-time token usage")
-    
+
     # Parameters
     with st.expander("🎛️ Parameters"):
         st.slider("Temperature", 0.0, 2.0, key="temperature", step=0.1,
                   help="Creativity vs determinism")
         st.slider("Top P", 0.0, 1.0, key="top_p", step=0.05)
         st.slider("Context Window", 512, 4096, key="num_ctx", step=256)
-        
+
         st.text_area("System Prompt", key="system_prompt", height=100)
-    
+
     st.divider()
-    
+
     # Session management
     st.markdown("**💬 Sessions**")
-    
+
     if st.button("➕ New Chat", use_container_width=True, type="primary"):
         st.session_state.messages = []
         new_id = SessionManager.create_session(user['id'])
         st.session_state.current_session = new_id
         st.rerun()
-    
+
     # List previous sessions
     sessions = SessionManager.list_sessions(user['id'], limit=20)
     for sess in sessions:
@@ -529,7 +564,7 @@ def render_sidebar(client: OllamaClient):
                     db_path = Path(CONFIG.DATABASE_URL.replace("sqlite:///", ""))
                     with sqlite3.connect(db_path) as conn:
                         conn.execute(
-                            "DELETE FROM sessions WHERE id = ? AND user_id = ?",
+                            "DELETE FROM sessions WHERE id =? AND user_id =?",
                             (sess['id'], user['id']),
                         )
                         conn.commit()
@@ -542,25 +577,24 @@ def render_sidebar(client: OllamaClient):
                     if cancelled is not None:
                         cancelled.stop_event.set()
                 st.rerun()
-    
+
     # Knowledge base
     st.divider()
     with st.expander("📚 Knowledge Base"):
-        uploaded = st.file_uploader("Upload documents", 
+        uploaded = st.file_uploader("Upload documents",
                                    accept_multiple_files=True,
                                    type=CONFIG.ALLOWED_UPLOAD_TYPES)
         if uploaded and st.button("Index Documents"):
             processor = MultimodalProcessor()
             rag = _init_global_rag()
-            
+
             progress = st.progress(0)
             for i, file in enumerate(uploaded):
                 content = processor.extract_document_text(file.getvalue(), file.name)
                 rag.add_document(user['id'], file.name, content, processor)
                 progress.progress((i + 1) / len(uploaded))
-            
-            st.success(f"Indexed {len(uploaded)} documents")
 
+            st.success(f"Indexed {len(uploaded)} documents")
 
 def _build_ollama_messages(system_prompt: str, history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert recent app messages to the Ollama wire format."""
@@ -573,7 +607,6 @@ def _build_ollama_messages(system_prompt: str, history: List[Dict[str, Any]]) ->
             msg_data["images"] = m["images"]
         msgs.append(msg_data)
     return msgs
-
 
 def _finalize_job(job: GenerationJob, user: Dict[str, Any], rag_used: bool) -> None:
     """Persist the finished job's output and clear it from the registry."""
@@ -625,18 +658,17 @@ def _finalize_job(job: GenerationJob, user: Dict[str, Any], rag_used: bool) -> N
     st.session_state.stop_requested = False
     _pop_job(user['id'], st.session_state.current_session)
 
-
 def render_file_queue_display():
     """Display file queue with metadata"""
     _init_file_queue()
     unprocessed_files = _get_unprocessed_files()
     queue_info = _get_queue_info()
-    
+
     if not unprocessed_files:
         return False
-    
+
     st.markdown("### 📎 Files Ready to Process")
-    
+
     # Queue statistics
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -645,13 +677,13 @@ def render_file_queue_display():
         st.metric("💾 Total Size", queue_info['total_size_display'])
     with col3:
         st.metric("✅ Processed", len(st.session_state.processed_files))
-    
+
     # File list with metadata
     st.markdown("#### Queued Files:")
-    
+
     for file_item in unprocessed_files:
         col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
-        
+
         with col1:
             st.write(f"📄 **{file_item.name}**")
         with col2:
@@ -660,10 +692,9 @@ def render_file_queue_display():
             st.caption(f"Type: {file_item.file_type}")
         with col4:
             st.caption(f"Added: {file_item.uploaded_at.strftime('%H:%M')}")
-    
+
     st.markdown("---")
     return True
-
 
 def _extract_file_text(filename: str, file_bytes: bytes) -> str:
     """
@@ -680,7 +711,7 @@ def _extract_file_text(filename: str, file_bytes: bytes) -> str:
                 import pdfplumber
                 text_parts = []
                 with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-                    for page in pdf.pages[:20]:  # max 20 pages
+                    for page in pdf.pages[:20]: # max 20 pages
                         t = page.extract_text()
                         if t:
                             text_parts.append(t)
@@ -729,7 +760,6 @@ def _extract_file_text(filename: str, file_bytes: bytes) -> str:
         return f"[Could not extract text: {e}]"
 
     return ""
-
 
 def render_business_analysis_tab(client: OllamaClient):
     """
@@ -872,7 +902,6 @@ def render_business_analysis_tab(client: OllamaClient):
                 use_container_width=True,
             )
 
-
 def render_chat_interface(client: OllamaClient):
     """Main chat interface with enhanced file handling"""
     user = st.session_state.user
@@ -917,26 +946,26 @@ def render_chat_interface(client: OllamaClient):
     st.markdown("""
     <style>
     div[data-testid="stPopover"] > button {
-        border-radius: 50% !important;
-        width: 38px !important;
-        height: 38px !important;
-        min-width: 38px !important;
-        padding: 0 !important;
-        font-size: 20px !important;
-        font-weight: 300 !important;
-        background: #ffffff !important;
-        border: 1px solid #e5e7eb !important;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.08) !important;
-        color: #111827 !important;
+        border-radius: 50%!important;
+        width: 38px!important;
+        height: 38px!important;
+        min-width: 38px!important;
+        padding: 0!important;
+        font-size: 20px!important;
+        font-weight: 300!important;
+        background: #ffffff!important;
+        border: 1px solid #e5e7eb!important;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.08)!important;
+        color: #111827!important;
         margin-bottom: 6px;
     }
     div[data-testid="stPopover"] > button:hover {
-        background: #f9fafb !important;
-        border-color: #d1d5db !important;
+        background: #f9fafb!important;
+        border-color: #d1d5db!important;
     }
     div[data-testid="stPopoverBody"] {
-        padding: 12px !important;
-        min-width: 240px !important;
+        padding: 12px!important;
+        min-width: 240px!important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -947,14 +976,14 @@ def render_chat_interface(client: OllamaClient):
     with input_cols[0]:
         with st.popover("＋", help="Attach files"):
             st.markdown("**📎 Upload Files**")
-            
+
             img_uploader = st.file_uploader(
                 "📷 Image",
                 type=["png", "jpg", "jpeg", "webp"],
                 key="img_upload",
                 label_visibility="visible",
             )
-            
+
             audio_file = st.file_uploader(
                 "🎤 Audio",
                 type=["wav", "mp3", "m4a"],
@@ -966,7 +995,7 @@ def render_chat_interface(client: OllamaClient):
                     "name": audio_file.name,
                     "bytes": audio_file.getvalue(),
                 }
-            
+
             doc_uploader = st.file_uploader(
                 "📄 Document",
                 type=["xlsx", "xls", "csv", "py", "json", "txt", "md", "pdf"],
@@ -974,7 +1003,7 @@ def render_chat_interface(client: OllamaClient):
                 label_visibility="visible",
                 help="Upload PDF, Excel, CSV, Python files — AI will read and analyze them"
             )
-            
+
             # ✅ FIX 1: Queue the file instead of replacing it
             if doc_uploader is not None:
                 file_id = _add_file_to_queue(doc_uploader)
@@ -1003,10 +1032,10 @@ def render_chat_interface(client: OllamaClient):
     # ✅ FIX 2: Enhanced file + prompt handling
     if prompt and not is_generating:
         prompt = SecurityManager.sanitize_input(prompt)
-        
+
         # Get unprocessed files from queue
         unprocessed_files = _get_unprocessed_files()
-        
+
         # Check if user wants to process files
         clean_keywords = ['clean', 'saaf', 'saf', 'fix', 'theek', 'saaf karo', 'clean karo', 'theek karo', 'saf karo']
         has_clean_intent = any(kw in prompt.lower() for kw in clean_keywords)
@@ -1017,7 +1046,7 @@ def render_chat_interface(client: OllamaClient):
             for file_item in unprocessed_files:
                 doc_name = file_item.name
                 doc_bytes = file_item.bytes_data
-                
+
                 # Add user message
                 user_msg = {
                     'role': 'user',
@@ -1027,42 +1056,42 @@ def render_chat_interface(client: OllamaClient):
                 }
                 st.session_state.messages.append(user_msg)
                 _mark_file_processed(file_item.file_id)
-                
+
                 # Process file
                 with st.chat_message("assistant"):
                     with st.status(f"🔍 Processing {doc_name}...", expanded=True) as status:
                         try:
                             from core.file_doctor import FileDoctor
-                            
+
                             # Save temp file
                             suffix = Path(doc_name).suffix
                             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode='wb') as tmp:
                                 tmp.write(doc_bytes)
                                 tmp_path = tmp.name
-                            
+
                             doctor = FileDoctor(client, st.session_state.model)
-                            
+
                             if doc_name.endswith(('.xlsx', '.xls', '.csv')):
                                 # Excel/CSV
                                 diag = doctor.diagnose_excel(tmp_path)
-                                
+
                                 if "error" in diag:
                                     st.error(f"❌ {diag['error']}")
                                 else:
                                     st.write(f"📊 **Size:** {diag['rows']} rows × {diag['cols']} cols")
                                     st.write(f"🐛 **Problems:** {len(diag['issues'])}")
-                                    
+
                                     if diag['issues']:
                                         with st.expander("Issues found"):
                                             for issue in diag['issues']:
                                                 st.write(f"• {issue}")
-                                    
+
                                     status.update(label="🧹 Cleaning...", state="running")
                                     cleaned_df, msg = doctor.clean_excel(diag)
-                                    
+
                                     st.success(f"✅ {msg}")
                                     st.dataframe(cleaned_df.head(10), use_container_width=True)
-                                    
+
                                     # Download
                                     output_name = f"cleaned_{doc_name}"
                                     if doc_name.endswith('.csv'):
@@ -1071,7 +1100,7 @@ def render_chat_interface(client: OllamaClient):
                                     else:
                                         cleaned_df.to_excel(output_name, index=False)
                                         mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                    
+
                                     with open(output_name, 'rb') as f:
                                         st.download_button(
                                             f"⬇️ Download {output_name}",
@@ -1083,30 +1112,30 @@ def render_chat_interface(client: OllamaClient):
                                             key=f"dl_{int(time.time())}"
                                         )
                                     Path(output_name).unlink(missing_ok=True)
-                            
+
                             elif doc_name.endswith('.py'):
                                 # Python
                                 diag = doctor.diagnose_python(tmp_path)
-                                
+
                                 st.write(f"📄 **Lines:** {diag['lines']}")
                                 st.write(f"🐛 **Problems:** {len(diag['issues'])}")
-                                
+
                                 if diag['issues']:
                                     with st.expander("Issues found"):
                                         for issue in diag['issues']:
                                             st.write(f"• {issue}")
-                                
+
                                 status.update(label="🧹 Cleaning...", state="running")
                                 cleaned_code, msg = doctor.clean_python(diag)
-                                
+
                                 st.success(f"✅ {msg}")
-                                
+
                                 tab1, tab2 = st.tabs(["✨ Cleaned", "📝 Original"])
                                 with tab1:
                                     st.code(cleaned_code, language='python')
                                 with tab2:
                                     st.code(diag['code'][:1500], language='python')
-                                
+
                                 st.markdown("---")
                                 st.download_button(
                                     label=f"⬇️ Download cleaned_{doc_name}",
@@ -1117,16 +1146,16 @@ def render_chat_interface(client: OllamaClient):
                                     type="primary",
                                     key=f"py_dl_{int(time.time())}"
                                 )
-                            
+
                             Path(tmp_path).unlink(missing_ok=True)
                             status.update(label="✅ Done!", state="complete")
-                            
+
                         except Exception as e:
                             st.error(f"❌ Error: {str(e)}")
                             import traceback
                             st.code(traceback.format_exc())
                             status.update(label="❌ Failed", state="error")
-            
+
             # Clear processed files
             _clear_processed_files()
             st.rerun()
@@ -1239,7 +1268,7 @@ def render_chat_interface(client: OllamaClient):
                         # Inject file content into the prompt as context
                         file_context = (
                             f"\n\n---\n📎 **Attached file: {doc_name}**\n\n"
-                            f"{extracted_text[:6000]}"  # cap at 6000 chars to stay in context window
+                            f"{extracted_text[:6000]}" # cap at 6000 chars to stay in context window
                             f"\n---\n"
                         )
                         augmented_prompt = prompt + file_context
@@ -1256,7 +1285,7 @@ def render_chat_interface(client: OllamaClient):
                         # Build messages with file context injected
                         ollama_msgs_with_file = _build_ollama_messages(
                             st.session_state.system_prompt,
-                            st.session_state.messages[:-1]  # history without the just-appended msg
+                            st.session_state.messages[:-1] # history without the just-appended msg
                         )
                         ollama_msgs_with_file.append({
                             "role": "user",
@@ -1316,7 +1345,7 @@ def render_chat_interface(client: OllamaClient):
                                 hits_list = [hits] if hits else []
                         except:
                             hits_list = []
-                        
+
                         for h in hits_list[:3]:
                             if hasattr(h, 'content'):
                                 text = h.content
@@ -1366,7 +1395,6 @@ def render_chat_interface(client: OllamaClient):
         )
         st.rerun()
 
-
 def _fragment_or_plain(run_every=None):
     """Decorator that uses @st.fragment(run_every=...) if supported, else plain function."""
     def decorator(fn):
@@ -1377,7 +1405,6 @@ def _fragment_or_plain(run_every=None):
                 return fn
         return fn
     return decorator
-
 
 @_fragment_or_plain(run_every=0.15)
 def _live_response_fragment(user: Dict[str, Any]) -> None:
@@ -1411,28 +1438,27 @@ def _live_response_fragment(user: Dict[str, Any]) -> None:
         except TypeError:
             st.rerun()
 
-
 def render_agents_tab(client: OllamaClient):
     """Multi-agent workflow interface"""
     user = st.session_state.user
     if not isinstance(st.session_state.agents, dict):
         st.session_state.agents = {}
-    
+
     if not SecurityManager.check_permission(user['role'], "agents"):
         st.error("Upgrade to Pro to use AI Agents")
         return
-    
+
     st.header("🤖 AI Agents")
     st.markdown("Create and orchestrate multi-agent workflows")
-    
+
     if AgentOrchestrator is None:
         st.error("Agent Orchestrator not available")
         return
-    
+
     orchestrator = AgentOrchestrator(client)
-    
+
     col1, col2 = st.columns([1, 2])
-    
+
     with col1:
         st.subheader("Create Agent")
         with st.form("agent_form"):
@@ -1440,12 +1466,12 @@ def render_agents_tab(client: OllamaClient):
             agent_prompt = st.text_area("System Prompt", height=150)
             agent_tools = st.multiselect("Tools", list(orchestrator.AVAILABLE_TOOLS.keys()) if hasattr(orchestrator, 'AVAILABLE_TOOLS') else [])
             agent_model = st.selectbox("Model", [get_optimal_model(), "llama3.1", "llama3.2:3b", "gemma2:2b", "llama3.2:1b"], key="agent_model")
-            
+
             if st.form_submit_button("Create Agent"):
                 agent = orchestrator.create_agent(agent_name, agent_prompt, agent_tools, agent_model)
                 st.session_state.agents[agent_name] = agent
                 st.success(f"Agent '{agent_name}' created!")
-        
+
         if st.session_state.agents:
             st.subheader("Your Agents")
             for name, agent in st.session_state.agents.items():
@@ -1456,33 +1482,33 @@ def render_agents_tab(client: OllamaClient):
                         <small>Tools: {', '.join(agent.tools if hasattr(agent, 'tools') else [])}</small>
                     </div>
                     """, unsafe_allow_html=True)
-    
+
     with col2:
         if MULTI_TASK_AVAILABLE:
             st.subheader("🚀 Run 5 Tasks Parallel")
             st.caption("Manager → splits task → 5 agents work simultaneously")
-            
+
             multi_task_input = st.text_input(
                 "Project name",
                 placeholder="e.g., Build AI App with database",
                 key="multi_task_input"
             )
-            
+
             col_a, col_b = st.columns(2)
             with col_a:
                 run_multi = st.button("⚡ Run 5 Tasks", type="primary", use_container_width=True)
             with col_b:
                 st.caption("Creates 5 parallel agents")
-            
+
             if run_multi and multi_task_input:
                 with st.spinner(f"Running 5 parallel tasks for '{multi_task_input}'..."):
                     try:
                         results, final = run_multi_task_project(multi_task_input)
-                        
+
                         st.success(f"✅ Completed {len(results)} tasks in parallel!")
-                        
+
                         tab1, tab2 = st.tabs(["📊 Results", "📝 Final Report"])
-                        
+
                         with tab1:
                             for i, r in enumerate(results, 1):
                                 with st.expander(f"Task {i}: {r['task'][:50]}...", expanded=(i==1)):
@@ -1490,47 +1516,46 @@ def render_agents_tab(client: OllamaClient):
                                     st.markdown(f"**Time:** {r.get('time', 'N/A')}s")
                                     st.markdown("**Result:**")
                                     st.write(r['result'][:500] + "..." if len(r['result']) > 500 else r['result'])
-                        
+
                         with tab2:
                             st.markdown("### Final Combined Report")
                             st.write(final)
-                            
+
                     except Exception as e:
                         st.error(f"Error: {e}")
                         st.info("Make sure you've created the features/multi_task folder with PowerShell script")
-            
+
             st.divider()
-        
+
         st.subheader("Run Workflow")
-        task = st.text_area("Task Description", height=100, 
+        task = st.text_area("Task Description", height=100,
                            placeholder="Describe the task you want agents to complete...")
-        
+
         available_agents = list(st.session_state.agents.keys())
         selected_agents = st.multiselect("Select Agents", available_agents)
-        
+
         if st.button("▶️ Run Workflow", type="primary") and task and selected_agents:
             result_placeholder = st.empty()
             full_output = ""
-            
+
             for chunk in orchestrator.execute_workflow(task, selected_agents):
                 full_output += chunk
                 result_placeholder.markdown(full_output)
 
-
 def render_analytics_tab():
     """Analytics dashboard"""
     user = st.session_state.user
-    
+
     if not SecurityManager.check_permission(user['role'], "analytics"):
         st.error("Access denied")
         return
-    
+
     st.header("📊 Analytics Dashboard")
-    
+
     data = Analytics.get_dashboard_data(user['id'])
-    
+
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
         UIComponents.metric_card(
             "Total Interactions",
@@ -1551,19 +1576,18 @@ def render_analytics_tab():
     with col4:
         sessions = len(SessionManager.list_sessions(user['id']))
         UIComponents.metric_card("Sessions", str(sessions))
-    
-    
+
     st.divider()
-    
+
     if ANALYTICS_PRO_AVAILABLE:
         st.subheader("🤖 Pro Analytics Engine")
         st.caption("Upload CSV/Excel to compute domain KPIs")
-        
+
         uploaded = st.file_uploader("Choose data file", type=['csv','xlsx','xls'], key="ana_upload")
         domain = st.selectbox("Domain", ["finance","sales","hr","supply_chain","operations","marketing",
                                        "ecommerce","logistics","healthcare","manufacturing","real_estate",
                                        "education","legal","general"], key="ana_domain")
-        
+
         if uploaded and st.button("Compute KPIs", type="primary", key="compute_kpi"):
             with st.spinner("Computing..."):
                 try:
@@ -1571,33 +1595,33 @@ def render_analytics_tab():
                     import tempfile
                     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix)
                     tmp.write(uploaded.getvalue()); tmp.close()
-                    
+
                     agent = AnalyticsAgent()
                     agent.upload_file(tmp.name)
                     result = agent.compute(domain=domain)
-                    
+
                     # Store in session
                     st.session_state.last_analytics_result = result
-                    
+
                     st.success(f"Computed {len(result.kpis)} KPIs for {domain}")
-                    
+
                     # Show quick preview
                     kpi_df = pd.DataFrame([asdict(k) for k in result.kpis])
                     st.dataframe(kpi_df[['name','value','unit','flag']], use_container_width=True)
-                    
+
                     if result.insights:
                         st.info("**Top Insights:**\n" + "\n".join([f"• {i}" for i in result.insights[:3]]))
-                    
+
                     os.unlink(tmp.name)
                 except Exception as e:
                     st.error(f"Compute failed: {e}")
     else:
         st.info("Install AnalyticsAgent Pro for KPI computation")
-    
+
     st.divider()
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         st.subheader("Daily Usage")
         if data['daily']:
@@ -1609,7 +1633,7 @@ def render_analytics_tab():
                 st.bar_chart(df.set_index('day')['tokens'])
         else:
             st.info("No data available")
-    
+
     with col2:
         st.subheader("Model Usage")
         if data['models']:
@@ -1622,27 +1646,26 @@ def render_analytics_tab():
         else:
             st.info("No data available")
 
-
 def render_sql_builder(client: OllamaClient):
     """Natural language to SQL"""
     user = st.session_state.user
-    
+
     st.header("🛠️ SQL Builder")
     st.markdown("Convert natural language to SQL queries")
-    
+
     col1, col2 = st.columns([1, 1])
-    
+
     with col1:
         schema = st.text_area("Database Schema", height=300,
-                             placeholder="CREATE TABLE users (id INT, name TEXT);\nCREATE TABLE orders (id INT, user_id INT, ...)",
+                             placeholder="CREATE TABLE users (id INT, name TEXT);\nCREATE TABLE orders (id INT, user_id INT,...)",
                              help="Paste your CREATE TABLE statements")
-    
+
     with col2:
         question = st.text_input("Your Question",
                                 placeholder="Find all users who made purchases last month")
-        
+
         dialect = st.selectbox("SQL Dialect", ["PostgreSQL", "MySQL", "SQLite", "SQL Server", "Oracle"])
-        
+
         if st.button("Generate SQL", type="primary") and question and schema:
             prompt = f"""You are an expert SQL developer. Convert the following natural language question into {dialect} SQL.
 
@@ -1658,7 +1681,7 @@ Requirements:
 - Use best practices for performance
 
 SQL:"""
-            
+
             with st.spinner("Generating..."):
                 try:
                     sql, _ = client.chat_once(
@@ -1666,12 +1689,12 @@ SQL:"""
                         [{"role": "user", "content": prompt}],
                         {"temperature": 0.1}
                     )
-                    
+
                     sql = re.sub(r'^```sql?\s*', '', sql.strip())
                     sql = re.sub(r'```$', '', sql.strip())
-                    
+
                     st.code(sql.strip(), language="sql")
-                    
+
                     if st.button("🔍 Explain Query"):
                         explain_prompt = f"Explain this SQL query in plain English:\n\n{sql}"
                         explanation, _ = client.chat_once(
@@ -1680,44 +1703,43 @@ SQL:"""
                             {"temperature": 0.3}
                         )
                         st.info(explanation)
-                        
+
                 except Exception as e:
                     st.error(f"Error: {e}")
-
 
 def render_project_generator():
     """Code project generator from chat"""
     st.header("📁 Project Generator")
-    
+
     FILE_RE = re.compile(r"###\s*FILE:\s*(.+?)\n```(\w+)?\n(.*?)```", re.DOTALL)
-    
+
     files = {}
     for msg in reversed(st.session_state.messages):
         if msg['role'] == 'assistant':
-            found = {fp.strip(): (lang, code.strip()) 
+            found = {fp.strip(): (lang, code.strip())
                     for fp, lang, code in FILE_RE.findall(msg['content'])}
             if found:
                 files = found
                 break
-    
+
     if not files:
         st.info("No code files detected in recent messages. Ask the assistant to generate code with file markers like:\n\n`### FILE: main.py` followed by code in triple backticks.")
         return
-    
+
     st.subheader(f"Detected {len(files)} Files")
-    
+
     for filepath, (lang, code) in files.items():
         with st.expander(f"📄 {filepath}"):
             st.code(code, language=lang or "text")
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for fp, (lang, code) in files.items():
                 zf.writestr(fp, code)
-        
+
         st.download_button(
             "⬇️ Download as ZIP",
             buf.getvalue(),
@@ -1725,33 +1747,32 @@ def render_project_generator():
             mime="application/zip",
             use_container_width=True
         )
-    
+
     with col2:
         req_lines = []
         for fp, (lang, code) in files.items():
             if "requirements" in fp.lower() or "package" in fp.lower():
                 req_lines.append(code)
-        
+
         if st.button("📋 Copy All to Clipboard", use_container_width=True):
             all_code = "\n\n".join([f"// {fp}\n{code}" for fp, (_, code) in files.items()])
             st.code(all_code)
             st.success("Ready to copy!")
 
-
 def render_export_tab():
     """Export conversation"""
     st.header("📤 Export")
-    
+
     if not st.session_state.messages:
         st.info("No messages to export")
         return
-    
+
     col1, col2, col3 = st.columns(3)
-    
+
     mgr = ExportManager()
     title = st.session_state.get('current_session', 'Conversation')
     metadata = {"model": st.session_state.model, "user": st.session_state.user['username']}
-    
+
     with col1:
         md_result = mgr.to_markdown(st.session_state.messages, title)
         st.download_button(
@@ -1761,7 +1782,7 @@ def render_export_tab():
             mime=md_result.mime_type,
             use_container_width=True
         )
-    
+
     with col2:
         json_result = mgr.to_json(st.session_state.messages, metadata)
         st.download_button(
@@ -1771,7 +1792,7 @@ def render_export_tab():
             mime=json_result.mime_type,
             use_container_width=True
         )
-    
+
     with col3:
         html_result = mgr.to_html(st.session_state.messages, title)
         st.download_button(
@@ -1781,30 +1802,29 @@ def render_export_tab():
             mime=html_result.mime_type,
             use_container_width=True
         )
-    
-    
+
     st.divider()
     st.subheader("📈 Analytics Export")
-    
+
     if not ANALYTICS_PRO_AVAILABLE:
         st.info("AnalyticsAgent Pro not available - install core.rag_system_pro")
     elif not st.session_state.get('last_analytics_result'):
         st.info("No analytics computed yet. Run analysis in Analytics tab first.")
     else:
         result = st.session_state.last_analytics_result
-        
+
         # Convert KPIs
         from dataclasses import asdict
         kpi_df = pd.DataFrame([asdict(k) for k in result.kpis]) if result.kpis else pd.DataFrame()
-        
+
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             if not kpi_df.empty:
                 csv = kpi_df.to_csv(index=False)
                 st.download_button("📊 KPIs CSV", csv, f"kpis_{datetime.now():%Y%m%d}.csv",
                                   "text/csv", key=f"kpi_csv_{uuid.uuid4().hex[:6]}", use_container_width=True)
-        
+
         with col2:
             if not kpi_df.empty:
                 buf = io.BytesIO()
@@ -1829,7 +1849,7 @@ def render_export_tab():
                 st.download_button("📗 KPIs Excel", buf.getvalue(), f"kpis_{datetime.now():%Y%m%d}.xlsx",
                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                   key=f"kpi_xls_{uuid.uuid4().hex[:6]}", use_container_width=True)
-        
+
         with col3:
             # JSON export of full result
             result_dict = {
@@ -1842,16 +1862,16 @@ def render_export_tab():
             st.download_button("📋 Full JSON", json.dumps(result_dict, indent=2),
                               f"analytics_{datetime.now():%Y%m%d}.json", "application/json",
                               key=f"ana_js_{uuid.uuid4().hex[:6]}", use_container_width=True)
-        
+
         with col4:
             # Insights as text
             insights_txt = "\n".join([f"• {i}" for i in result.insights]) if result.insights else "No insights"
             st.download_button("📝 Insights", insights_txt, f"insights_{datetime.now():%Y%m%d}.txt",
                               "text/plain", key=f"ins_{uuid.uuid4().hex[:6]}", use_container_width=True)
-        
+
         with st.expander("Preview KPIs"):
             st.dataframe(kpi_df, use_container_width=True)
-    
+
     if st.session_state.user.get('role') == 'admin':
         st.divider()
         st.subheader("Database Backup")
@@ -1866,22 +1886,21 @@ def render_export_tab():
                     use_container_width=True
                 )
 
-
 def render_admin_database():
     """Admin Database Viewer"""
     st.header("🗄️ Database Admin")
-    
+
     tab1, tab2 = st.tabs(["RAG System DB", "App DB"])
-    
+
     with tab1:
         db_path = "rag_system.db"
         if not os.path.exists(db_path):
             st.warning(f"{db_path} not found - upload a document first to create it")
             return
-            
+
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-        
+
         col1, col2, col3, col4 = st.columns(4)
 
         def _safe_count(sql: str, label: str, target) -> None:
@@ -1898,40 +1917,39 @@ def render_admin_database():
         _safe_count("SELECT COUNT(*) as c FROM chunks", "Chunks", col2)
         _safe_count("SELECT COUNT(*) as c FROM chat_history", "Chat Messages", col3)
         col4.metric("DB Size", f"{os.path.getsize(db_path)/1024/1024:.2f} MB")
-        
+
         st.divider()
-        
+
         table = st.selectbox("Select Table", ["documents", "chunks", "chat_history", "agent_runs"])
         limit = st.slider("Rows", 10, 500, 50)
-        
+
         try:
             df = pd.read_sql_query(f"SELECT * FROM {table} ORDER BY rowid DESC LIMIT {limit}", conn)
-            
+
             if 'embedding' in df.columns:
                 df = df.drop(columns=['embedding'])
             for col in ['content', 'input', 'output']:
                 if col in df.columns:
                     df[col] = df[col].astype(str).str[:200] + "..."
-            
+
             st.dataframe(df, use_container_width=True, height=400)
-            
+
             csv = df.to_csv(index=False)
             st.download_button("📥 Download CSV", csv, f"{table}.csv", "text/csv")
         except Exception as e:
             st.error(f"Error reading table: {e}")
-        
+
         conn.close()
-    
+
     with tab2:
         st.info("Main app database viewer - configure path in code if needed")
-
 
 def main():
     """Main application"""
     UIComponents.apply_custom_theme()
-    
+
     SessionManager.init_session()
-    
+
     defaults = {
         'user': None,
         'messages': [],
@@ -1957,43 +1975,44 @@ def main():
             st.session_state[k] = v
     if not isinstance(st.session_state.agents, dict):
         st.session_state.agents = {}
-    
-    ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+
+    # --- UPDATED FOR OLLAMA CLOUD ---
+    ollama_host = st.secrets.get("OLLAMA_HOST", os.getenv("OLLAMA_HOST", "https://ollama.com"))
     client = OllamaClient(ollama_host)
-    
+
     if not st.session_state.user:
         login_screen()
         return
-    
+
     with st.sidebar:
         render_sidebar(client)
-    
+
     tab_icons = ["💬", "🤖", "🛠️", "📊", "🏢", "📁", "📤"]
     tab_labels = ["Chat", "Agents", "SQL Builder", "Analytics", "Business Analysis", "Project", "Export"]
-    
+
     available_tabs = []
     tab_panels = []
-    
+
     for icon, label in zip(tab_icons, tab_labels):
         feature_key = label.lower().replace(" ", "_")
         permission_key = feature_key
         if feature_key == "sql_builder":
             permission_key = "sql_builder"
         if feature_key in ["chat", "project", "export"] or SecurityManager.check_permission(
-            st.session_state.user.get('role', 'guest'), 
+            st.session_state.user.get('role', 'guest'),
             permission_key
         ):
             available_tabs.append(f"{icon} {label}")
-    
+
     if not available_tabs:
         available_tabs = ["💬 Chat"]
-    
+
     tabs = st.tabs(available_tabs)
-    
+
     for i, tab in enumerate(tabs):
         with tab:
             tab_name = available_tabs[i].split(" ", 1)[1].lower().replace(" ", "_")
-            
+
             if tab_name == "chat":
                 render_chat_interface(client)
             elif tab_name == "agents":
@@ -2008,7 +2027,6 @@ def main():
                 render_project_generator()
             elif tab_name == "export":
                 render_export_tab()
-
 
 if __name__ == "__main__":
     main()
