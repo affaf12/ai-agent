@@ -80,7 +80,7 @@ except ImportError:
 from ui.components import UIComponents
 from core.config import CONFIG, get_optimal_model, get_model_info, LLM_MODEL
 
-# --- PATCH: Ollama Cloud Support ---
+# --- PATCH: Ollama Cloud Support with Error Handling ---
 try:
     from ollama import Client as _OllamaOfficial
     _OFFICIAL_AVAILABLE = True
@@ -115,21 +115,34 @@ class OllamaClientCloud:
             return False, str(e), []
 
     def chat_stream(self, model, messages, options):
-        if self._use_official:
-            stream = self.client.chat(model=model, messages=messages, options=options or {}, stream=True)
-            for chunk in stream:
-                content = chunk.get('message', {}).get('content', '')
-                if content:
-                    yield content
-        else:
-            yield from self.client.chat_stream(model, messages, options)
+        try:
+            if self._use_official:
+                stream = self.client.chat(model=model, messages=messages, options=options or {}, stream=True)
+                for chunk in stream:
+                    content = chunk.get('message', {}).get('content', '')
+                    if content:
+                        yield content
+            else:
+                yield from self.client.chat_stream(model, messages, options)
+        except Exception as e:
+            # CRITICAL: Catch ResponseError and show friendly message
+            error_msg = str(e)
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                yield "⚠️ **Authentication Failed**\n\nYour Ollama API key is invalid or revoked. You leaked your key in chat — create a NEW key at ollama.com/settings/keys"
+            elif "404" in error_msg or "not found" in error_msg.lower():
+                yield f"⚠️ **Model '{model}' not found on Ollama Cloud**\n\nTry: llama3.1:8b, gemma2:9b, or qwen2.5:7b"
+            else:
+                yield f"⚠️ **Ollama Error:** {error_msg}"
 
     def chat_once(self, model, messages, options):
-        if self._use_official:
-            resp = self.client.chat(model=model, messages=messages, options=options or {}, stream=False)
-            return resp['message']['content'], None
-        else:
-            return self.client.chat_once(model, messages, options)
+        try:
+            if self._use_official:
+                resp = self.client.chat(model=model, messages=messages, options=options or {}, stream=False)
+                return resp['message']['content'], None
+            else:
+                return self.client.chat_once(model, messages, options)
+        except Exception as e:
+            return f"Error: {str(e)}", None
 
 OllamaClient = OllamaClientCloud
 
@@ -370,14 +383,19 @@ def render_sidebar(client):
         elif isinstance(m, str): models.append(m)
     models = [m for m in models if m]
 
-    if models:
-        if st.session_state.model not in models:
-            st.session_state.model = models[0]
-        selected = st.selectbox("🤖 Model", models, index=models.index(st.session_state.model))
-        st.session_state.model = selected
-    else:
-        st.warning("No models - check API key")
-        if err: st.error(err)
+    # Default to cloud models if none found
+    if not models:
+        models = ["llama3.1:8b", "gemma2:9b", "qwen2.5:7b"]
+        st.info("Using default cloud models")
+
+    if st.session_state.model not in models:
+        st.session_state.model = models[0]
+
+    selected = st.selectbox("🤖 Model", models, index=models.index(st.session_state.model))
+    st.session_state.model = selected
+
+    if not ok and err:
+        st.error(f"API Error: {err}")
 
     st.toggle("🔍 RAG", key="rag_enabled")
     st.toggle("🖼️ Vision", key="vision_enabled")
@@ -417,16 +435,20 @@ def render_chat_interface(client):
             placeholder = st.empty()
             full = ""
             msgs = _build_ollama_messages(st.session_state.system_prompt, st.session_state.messages)
-            for chunk in client.chat_stream(st.session_state.model, msgs, {"temperature":st.session_state.temperature}):
-                full += chunk
-                placeholder.markdown(full + "▌")
-            placeholder.markdown(full)
+            try:
+                for chunk in client.chat_stream(st.session_state.model, msgs, {"temperature":st.session_state.temperature}):
+                    full += chunk
+                    placeholder.markdown(full + "▌")
+                placeholder.markdown(full)
+            except Exception as e:
+                full = f"⚠️ Error: {str(e)}"
+                placeholder.error(full)
         st.session_state.messages.append({"role":"assistant","content":full})
 
 def main():
     st.set_page_config(page_title="Ollama Pro", layout="wide")
     SessionManager.init_session()
-    defaults = {'user':None,'messages':[],'model':get_optimal_model(),'temperature':0.7,'top_p':0.9,'num_ctx':2048,'system_prompt':'You are helpful','rag_enabled':False,'vision_enabled':True,'tts_enabled':False,'current_session':None}
+    defaults = {'user':None,'messages':[],'model':'llama3.1:8b','temperature':0.7,'top_p':0.9,'num_ctx':2048,'system_prompt':'You are helpful','rag_enabled':False,'vision_enabled':True,'tts_enabled':False,'current_session':None}
     for k,v in defaults.items():
         if k not in st.session_state: st.session_state[k]=v
 
